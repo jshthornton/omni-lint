@@ -1,0 +1,7 @@
+# a sample schema
+
+type User {
+  name: String!
+  email: String
+  posts: [Post!]!
+}

@@ -1,0 +1,14 @@
+type Tag {
+  label: String
+}
+type UnusedThing {
+  x: String
+}
+input CreatePostInput {
+  title: String!
+  oldField: String @deprecated(reason: "use title")
+}
+interface Node {
+  id: ID!
+}
+union Thing = Tag | Tag

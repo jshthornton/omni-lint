@@ -1,0 +1,2 @@
+# Route .graphql files to the sandboxed WASM demo plugin
+prefer = "demo-gql"

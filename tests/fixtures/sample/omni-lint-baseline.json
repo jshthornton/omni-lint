@@ -1,0 +1,19 @@
+{
+  "generated_at": "epoch-1790108518",
+  "entries": [
+    {
+      "rule_id": "graphql/type-name-pascal",
+      "path": "schema/comment.graphql",
+      "subject": "type:comment_type",
+      "line": 1,
+      "fingerprint": "89153b93e75fd22d"
+    },
+    {
+      "rule_id": "graphql/no-undefined-type",
+      "path": "schema/post.graphql",
+      "subject": "type-ref:user_ref",
+      "line": 3,
+      "fingerprint": "1d79440dcf0f08ea"
+    }
+  ]
+}

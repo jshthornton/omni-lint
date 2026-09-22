@@ -1,0 +1,5 @@
+type EmptyThing {
+}
+type User {
+  dup: Bool
+}

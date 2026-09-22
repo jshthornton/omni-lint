@@ -1,0 +1,401 @@
+//! omni-lint CLI: check / todo generate / todo prune / list-rules.
+
+use omni_core::baseline::{self, Baseline};
+use omni_core::config::Config;
+use omni_core::report::{format_text, write_json, OutputFormat};
+use omni_core::runner::{run_check, ExitCode};
+use omni_core::{Plugin, Registry};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let code = match run(&args) {
+        Ok(code) => code,
+        Err((message, code)) => {
+            eprintln!("error: {message}");
+            code
+        }
+    };
+    std::process::exit(code as i32)
+}
+
+struct Usage {
+    kind: UsageKind,
+    positional: Vec<String>,
+    format: OutputFormat,
+}
+
+enum UsageKind {
+    Check,
+    TodoGenerate,
+    TodoPrune,
+    ListRules,
+    Help,
+    Version,
+}
+
+fn parse_args(args: &[String]) -> Result<Usage, (String, ExitCode)> {
+    let mut kind: Option<UsageKind> = None;
+    let mut positional = Vec::new();
+    let mut format: Option<OutputFormat> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        match a.as_str() {
+            "--help" | "-h" => {
+                return Ok(Usage {
+                    kind: UsageKind::Help,
+                    positional: vec![],
+                    format: OutputFormat::Text,
+                })
+            }
+            "--version" | "-V" => {
+                return Ok(Usage {
+                    kind: UsageKind::Version,
+                    positional: vec![],
+                    format: OutputFormat::Text,
+                })
+            }
+            "--format" | "-f" => {
+                i += 1;
+                let v = args.get(i).ok_or_else(|| ("--format needs a value".to_string(), ExitCode::Config))?;
+                format = Some(
+                    OutputFormat::parse(v)
+                        .ok_or((format!("unknown output format \"{v}\" (text, json)"), ExitCode::Config))?,
+                );
+            }
+            "--format=json" | "--format=text" => {
+                let v = a.trim_start_matches("--format=");
+                format = Some(
+                    OutputFormat::parse(v)
+                        .ok_or((format!("unknown output format \"{v}\" (text, json)"), ExitCode::Config))?,
+                );
+            }
+            "--" => {} // end of flags; positional-only args follow
+            "check" | "todo" | "list-rules" if kind.is_none() => {
+                if a == "todo" {
+                    i += 1;
+                    kind = Some(match args.get(i).map(|s| s.as_str()) {
+                        Some("generate") => UsageKind::TodoGenerate,
+                        Some("prune") => UsageKind::TodoPrune,
+                        _ => return Err(("todo requires `generate` or `prune`".into(), ExitCode::Config)),
+                    });
+                } else {
+                    kind = Some(if a == "check" {
+                        UsageKind::Check
+                    } else {
+                        UsageKind::ListRules
+                    });
+                }
+            }
+            _ => positional.push(a.clone()),
+        }
+        i += 1;
+    }
+    Ok(Usage {
+        kind: kind.unwrap_or(UsageKind::Check),
+        positional,
+        format: format.unwrap_or(OutputFormat::Text),
+    })
+}
+
+fn run(args: &[String]) -> Result<ExitCode, (String, ExitCode)> {
+    let usage = parse_args(args)?;
+    match usage.kind {
+        UsageKind::Help => {
+            print_help();
+            Ok(ExitCode::Clean)
+        }
+        UsageKind::Version => {
+            println!("omni-lint {}", env!("CARGO_PKG_VERSION"));
+            Ok(ExitCode::Clean)
+        }
+        UsageKind::ListRules => {
+            let root = usage
+                .positional
+                .first()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let cfg = config_for(&root)?;
+            let registry = registry_for(Some(&cfg));
+            for m in registry.rule_meta() {
+                println!(
+                    "{}: {} (default severity: {})",
+                    m.id, m.description, m.default_severity
+                );
+            }
+            Ok(ExitCode::Clean)
+        }
+        UsageKind::Check => {
+            let root = usage
+                .positional
+                .first()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            check(&root, usage.format)
+        }
+        UsageKind::TodoGenerate => {
+            let root = usage
+                .positional
+                .first()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            todo_generate(&root)
+        }
+        UsageKind::TodoPrune => {
+            let root = usage
+                .positional
+                .first()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            todo_prune(&root)
+        }
+    }
+}
+
+fn build_registry(repo: &mut Registry) {
+    repo.register(Arc::new(omni_graphql::GraphqlPlugin), omni_graphql::rules::all_rules());
+}
+
+
+
+/// Native plugins + any `.wasm` plugins found under `<config dir>/plugins/`.
+/// A third-party module that fails validation degrades to a load error on
+/// that plugin (surfaced by the runner as a config-severity warning) instead
+/// of bricking the whole run.
+fn registry_for(config: Option<&omni_core::config::Config>) -> Registry {
+    let mut r = Registry::new();
+    build_registry(&mut r);
+    if let Some(cfg) = config {
+        let plugins_dir = cfg.dir.join("plugins");
+        if plugins_dir.is_dir() {
+            let limits = load_wasm_limits(&plugins_dir);
+            let (wasm_plugins, errors) = omni_wasm::WasmPlugin::discover(&plugins_dir, limits);
+            for (path, err) in errors {
+                eprintln!("warning: plugin {} failed to load: {err}", path.display());
+            }
+            for plugin in wasm_plugins {
+                if let Some(err) = plugin.load_error() {
+                    eprintln!(
+                        "warning: plugin {} unusable: {err}",
+                        plugin.module_path().display()
+                    );
+                    continue;
+                }
+                let mut rules: Vec<std::sync::Arc<dyn omni_core::Rule>> = Vec::new();
+                if let Some(meta) = plugin.meta() {
+                    for rule in &meta.rules {
+                        rules.push(std::sync::Arc::new(omni_wasm::MetaOnlyRule::new(
+                            omni_core::plugin::RuleMeta {
+                                id: leak_static(&rule.id),
+                                description: leak_static(&rule.description),
+                                default_severity: rule
+                                    .severity
+                                    .as_deref()
+                                    .and_then(omni_core::Severity::parse)
+                                    .unwrap_or(omni_core::Severity::Warning),
+                                // findings arrive via the plugin itself
+                                requires: "",
+                            },
+                        )));
+                    }
+                }
+                let plugin_arc: std::sync::Arc<dyn Plugin> = std::sync::Arc::new(plugin);
+                r.register(plugin_arc, rules);
+            }
+        }
+    }
+    r
+}
+
+fn leak_static(s: &str) -> &'static str {
+    Box::leak(s.to_string().into_boxed_str())
+}
+
+/// Optional `plugins/limits.toml`: per-module fuel tweaks.
+/// ```toml
+/// [limits."my-plugin.wasm"]
+/// fuel = 10_000_000_000
+/// ```
+fn load_wasm_limits(plugins_dir: &Path) -> omni_wasm::WasmLimits {
+    let path = plugins_dir.join("limits.toml");
+    let _ = &path;
+    let mut default = omni_wasm::WasmLimits { fuel: Some(omni_wasm::DEFAULT_FUEL) };
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Ok(raw) = toml::from_str::<toml::Table>(&text) {
+            // A global default without named section is fine too.
+            if let Some(fuel) = raw.get("fuel").and_then(|v| v.as_integer()) {
+                default.fuel = Some(fuel.max(0) as u64);
+            }
+            if let Some(section) = raw.get("limits") {
+                let _ = section; // per-module overrides land with a config rewrite
+            }
+        }
+    }
+    default
+}
+
+fn config_for(root: &Path) -> Result<Config, (String, ExitCode)> {
+    let start = if root.is_dir() { root } else { root.parent().unwrap_or(Path::new(".")) };
+    let cfg = Config::load(start).map_err(|e| (e, ExitCode::Config))?;
+    Ok(cfg)
+}
+
+fn check(root: &Path, format: OutputFormat) -> Result<ExitCode, (String, ExitCode)> {
+    let cfg = config_for(root)?;
+    let registry = registry_for(Some(&cfg));
+    let result = run_check(root, &cfg, &registry).map_err(|e| (e, ExitCode::Config))?;
+
+    if format == OutputFormat::Json {
+        let sources = sources_map(root, &cfg, &registry)?;
+        let stdout = std::io::stdout();
+        let mut w = stdout.lock();
+        write_json(&mut w, result.files, &result.findings, &sources, &result.totals)
+            .map_err(|e| (e, ExitCode::Internal))?;
+    } else {
+        let sources = sources_map(root, &cfg, &registry)?;
+        let stdout = std::io::stdout();
+        let mut w = stdout.lock();
+        for r in &result.findings {
+            let source = sources
+                .get(&r.diag.source_id)
+                .ok_or(("internal: unknown source id".to_string(), ExitCode::Internal))?;
+            write!(w, "{}", format_text(r, source)).ok();
+        }
+        let files_word = if result.files == 1 { "file" } else { "files" };
+        let findings_word = if result.findings.len() == 1 && result.baselined == 0 {
+            "finding"
+        } else {
+            "findings"
+        };
+        writeln!(
+            w,
+            "{}: {} {}, {} baselined.",
+            result.files,
+            result.findings.len(),
+            findings_word,
+            result.baselined
+        )
+        .ok();
+        let _ = files_word;
+    }
+
+    if result.findings.is_empty() {
+        Ok(ExitCode::Clean)
+    } else {
+        Ok(ExitCode::Findings)
+    }
+}
+
+fn sources_map(
+    root: &Path,
+    cfg: &Config,
+    registry: &Registry,
+) -> Result<omni_core::SourceMap, (String, ExitCode)> {
+    let allowed: Option<Vec<String>> = if cfg.extensions.is_some() {
+        None
+    } else {
+        Some(
+            registry
+                .plugins
+                .iter()
+                .flat_map(|p| p.extensions().iter().map(|e| e.to_string()))
+                .collect(),
+        )
+    };
+    let mut map = omni_core::SourceMap::new();
+    let sources = omni_core::discovery::discover(root, cfg, allowed.as_deref())
+        .map_err(|e| (e, ExitCode::Config))?;
+    for s in sources {
+        map.insert(s.id, s);
+    }
+    Ok(map)
+}
+
+/// `omni-lint todo generate`: record every current finding in the baseline;
+/// regenerating replaces the file wholesale (regenerate semantics).
+fn todo_generate(root: &Path) -> Result<ExitCode, (String, ExitCode)> {
+    let cfg = config_for(root)?;
+    let baseline_path = cfg
+        .baseline
+        .clone()
+        .unwrap_or_else(|| cfg.dir.join("omni-lint-baseline.json"));
+    let registry = registry_for(Some(&cfg));
+    let entries =
+        omni_core::runner::collect_all_for_baseline(root, &cfg, &registry)
+            .map_err(|e| (e, ExitCode::Config))?;
+    let baseline = Baseline {
+        generated_at: Some(baseline::now_iso()),
+        entries,
+    };
+    baseline
+        .save(&baseline_path)
+        .map_err(|e| (e, ExitCode::Internal))?;
+    println!(
+        "recorded {} findings in {}",
+        baseline.entries.len(),
+        baseline_path.display()
+    );
+    Ok(ExitCode::Clean)
+}
+
+/// `omni-lint todo prune`: drop baseline entries whose finding no longer
+/// exists in the current tree.
+fn todo_prune(root: &Path) -> Result<ExitCode, (String, ExitCode)> {
+    let cfg = config_for(root)?;
+    let baseline_path = cfg
+        .baseline
+        .clone()
+        .unwrap_or_else(|| cfg.dir.join("omni-lint-baseline.json"));
+    if !baseline_path.is_file() {
+        return Err((
+            format!("no baseline at {}", baseline_path.display()),
+            ExitCode::Config,
+        ));
+    }
+    let baseline = Baseline::load(&baseline_path).map_err(|e| (e, ExitCode::Internal))?;
+    let registry = registry_for(Some(&cfg));
+    // Generate fresh entries without applying the old baseline, so every
+    // live finding is visible for the prune comparison.
+    let fresh = omni_core::runner::collect_all_for_baseline(
+        root,
+        &Config {
+            baseline: None,
+            ..cfg.clone()
+        },
+        &registry,
+    )
+    .map_err(|e| (e, ExitCode::Config))?;
+    let mut live = std::collections::BTreeSet::new();
+    for e in fresh {
+        live.insert((e.rule_id, e.path, e.subject, e.fingerprint));
+    }
+    let (pruned, removed) = omni_core::runner::prune(baseline, &live);
+    pruned
+        .save(&baseline_path)
+        .map_err(|e| (e, ExitCode::Internal))?;
+    println!("pruned {removed} stale baseline entr{}", if removed == 1 { "y" } else { "ies" });
+    Ok(ExitCode::Clean)
+}
+
+fn print_help() {
+    println!(
+        "omni-lint {} — a framework for building fast, language-agnostic linters
+built-in plugins: graphql
+
+USAGE:
+    omni-lint [COMMAND] [ROOT] [--format text|json]
+
+COMMANDS:
+    check          lint ROOT (default: .); exits 1 when fixes/findings are new
+    todo generate  record all current findings in the baseline (TODO list)
+    todo prune     drop baseline entries for findings that no longer exist
+    list-rules     list all registered rules
+
+CONFIG:
+    omni-lint.toml at the lint root; see README for its schema",
+        env!("CARGO_PKG_VERSION")
+    );
+}

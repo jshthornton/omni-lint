@@ -1,0 +1,6 @@
+/target
+.pi/
+tests/fixtures/bench-*/schema/
+tests/fixtures/bench-*/omni-lint-baseline.json
+plugins-src/demo-graphql-plugin/target/
+*.target
