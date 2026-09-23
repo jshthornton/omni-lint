@@ -7,6 +7,7 @@ use omni_core::runner::{run_check, ExitCode};
 use omni_core::{Plugin, Registry};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "graphql")]
 use std::sync::Arc;
 
 fn main() {
@@ -25,6 +26,12 @@ struct Usage {
     kind: UsageKind,
     positional: Vec<String>,
     format: OutputFormat,
+    /// `--max-warnings N`: exit 0 when only warnings remain and their count
+    /// is <= N. None: any finding fails the run.
+    max_warnings: Option<usize>,
+    /// `--pairs` (todo generate only): record per-(rule, path) suppression
+    /// budgets instead of per-finding identities.
+    pairs: bool,
 }
 
 enum UsageKind {
@@ -40,6 +47,8 @@ fn parse_args(args: &[String]) -> Result<Usage, (String, ExitCode)> {
     let mut kind: Option<UsageKind> = None;
     let mut positional = Vec::new();
     let mut format: Option<OutputFormat> = None;
+    let mut max_warnings: Option<usize> = None;
+    let mut pair_note = false;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -49,6 +58,8 @@ fn parse_args(args: &[String]) -> Result<Usage, (String, ExitCode)> {
                     kind: UsageKind::Help,
                     positional: vec![],
                     format: OutputFormat::Text,
+                    max_warnings: None,
+                    pairs: false,
                 })
             }
             "--version" | "-V" => {
@@ -56,6 +67,8 @@ fn parse_args(args: &[String]) -> Result<Usage, (String, ExitCode)> {
                     kind: UsageKind::Version,
                     positional: vec![],
                     format: OutputFormat::Text,
+                    max_warnings: None,
+                    pairs: false,
                 })
             }
             "--format" | "-f" => {
@@ -74,6 +87,36 @@ fn parse_args(args: &[String]) -> Result<Usage, (String, ExitCode)> {
                 );
             }
             "--" => {} // end of flags; positional-only args follow
+            "--pairs" => {
+                pair_note = true;
+            }
+
+            "--max-warnings" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| ("--max-warnings needs a count".to_string(), ExitCode::Config))?;
+                let n: usize = v
+                    .parse()
+                    .map_err(|_| (format!("--max-warnings must be a count, got {v:?}"), ExitCode::Config))?;
+                max_warnings = Some(n);
+            }
+            s if s.strip_prefix("--max-warnings=").is_some() => {
+                let v = s.strip_prefix("--max-warnings=").unwrap();
+                let n: usize = v
+                    .parse()
+                    .map_err(|_| (format!("--max-warnings must be a count, got {v:?}"), ExitCode::Config))?;
+                max_warnings = Some(n);
+            }
+            // Unknown flags used to silently get treated as ROOT; reject them
+            // as configuration mistakes instead.
+            s if s.starts_with('-') && s != "-" => {
+                return Err((
+                    format!("unknown argument {s:?}; use `-h` for usage"),
+                    ExitCode::Config,
+                ));
+            }
+
             "check" | "todo" | "list-rules" if kind.is_none() => {
                 if a == "todo" {
                     i += 1;
@@ -98,6 +141,8 @@ fn parse_args(args: &[String]) -> Result<Usage, (String, ExitCode)> {
         kind: kind.unwrap_or(UsageKind::Check),
         positional,
         format: format.unwrap_or(OutputFormat::Text),
+        max_warnings,
+        pairs: pair_note,
     })
 }
 
@@ -134,7 +179,7 @@ fn run(args: &[String]) -> Result<ExitCode, (String, ExitCode)> {
                 .first()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."));
-            check(&root, usage.format)
+            check(&root, usage.format, usage.max_warnings)
         }
         UsageKind::TodoGenerate => {
             let root = usage
@@ -142,7 +187,7 @@ fn run(args: &[String]) -> Result<ExitCode, (String, ExitCode)> {
                 .first()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."));
-            todo_generate(&root)
+            todo_generate(&root, usage.pairs)
         }
         UsageKind::TodoPrune => {
             let root = usage
@@ -156,7 +201,19 @@ fn run(args: &[String]) -> Result<ExitCode, (String, ExitCode)> {
 }
 
 fn build_registry(repo: &mut Registry) {
-    repo.register(Arc::new(omni_graphql::GraphqlPlugin), omni_graphql::rules::all_rules());
+    // Example plugin packs are opt-in at build time, NOT part of the default
+    // package: the framework ships rule-free (see README); third-party packs
+    // load at runtime from plugins/*.wasm.
+    #[cfg(feature = "graphql")]
+    {
+        repo.register(Arc::new(omni_graphql::GraphqlPlugin), omni_graphql::rules::all_rules());
+    }
+    #[cfg(not(feature = "graphql"))]
+    {
+        // Rule-free framework build: nothing registered here. Third-party
+        // packs load at runtime from plugins/*.wasm (see registry_for).
+        let _ = repo;
+    }
 }
 
 
@@ -243,9 +300,40 @@ fn config_for(root: &Path) -> Result<Config, (String, ExitCode)> {
     Ok(cfg)
 }
 
-fn check(root: &Path, format: OutputFormat) -> Result<ExitCode, (String, ExitCode)> {
+fn check(root: &Path, format: OutputFormat, max_warnings: Option<usize>) -> Result<ExitCode, (String, ExitCode)> {
     let cfg = config_for(root)?;
     let registry = registry_for(Some(&cfg));
+    if registry.plugins.is_empty() {
+        eprintln!(
+            "warning: no lint plugins loaded. Install example packs (cargo build -p omni-lint --features graphql) or drop .wasm modules in <config dir>/plugins/."
+        );
+    }
+
+    // Config validation: unknown rule ids and sections for unloaded plugins
+    // are configuration errors (exit 2), matching --list-rules output.
+    for id in cfg.rules.keys() {
+        let known = registry.rule_meta().iter().any(|m| m.id == id);
+        if !known {
+            return Err((
+                format!(
+                    "unknown rule \"{id}\" in config; run `omni-lint list-rules` for the registered set"
+                ),
+                ExitCode::Config,
+            ));
+        }
+    }
+    for (plugin, _) in &cfg.plugins {
+        let loaded = registry
+            .plugins
+            .iter()
+            .any(|p| p.id() == plugin.as_str());
+        if !loaded {
+            eprintln!(
+                "warning: config references plugin \"{plugin}\" but no such plugin is loaded (not a builtin; missing from plugins/?)"
+            );
+        }
+    }
+
     let result = run_check(root, &cfg, &registry).map_err(|e| (e, ExitCode::Config))?;
 
     if format == OutputFormat::Json {
@@ -284,6 +372,14 @@ fn check(root: &Path, format: OutputFormat) -> Result<ExitCode, (String, ExitCod
 
     if result.findings.is_empty() {
         Ok(ExitCode::Clean)
+    } else if let Some(limit) = max_warnings {
+        let errors = result.totals.get(&omni_core::Severity::Error).copied().unwrap_or(0);
+        let warnings = result.totals.get(&omni_core::Severity::Warning).copied().unwrap_or(0);
+        if errors == 0 && warnings <= limit {
+            Ok(ExitCode::Clean)
+        } else {
+            Ok(ExitCode::Findings)
+        }
     } else {
         Ok(ExitCode::Findings)
     }
@@ -316,7 +412,7 @@ fn sources_map(
 
 /// `omni-lint todo generate`: record every current finding in the baseline;
 /// regenerating replaces the file wholesale (regenerate semantics).
-fn todo_generate(root: &Path) -> Result<ExitCode, (String, ExitCode)> {
+fn todo_generate(root: &Path, pair_mode: bool) -> Result<ExitCode, (String, ExitCode)> {
     let cfg = config_for(root)?;
     let baseline_path = cfg
         .baseline
@@ -326,16 +422,43 @@ fn todo_generate(root: &Path) -> Result<ExitCode, (String, ExitCode)> {
     let entries =
         omni_core::runner::collect_all_for_baseline(root, &cfg, &registry)
             .map_err(|e| (e, ExitCode::Config))?;
-    let baseline = Baseline {
-        generated_at: Some(baseline::now_iso()),
-        entries,
+    let baseline = if pair_mode {
+        // Ratchet granularity: (rule, path) -> count. Suppress exactly the
+        // recorded backlog; over-baseline growth re-flags.
+        let mut counts: std::collections::BTreeMap<(String, String), u64> = Default::default();
+        for e in &entries {
+            *counts
+                .entry((e.rule_id.clone(), e.path.clone()))
+                .or_insert(0) += 1;
+        }
+        Baseline {
+            generated_at: Some(baseline::now_iso()),
+            entries: Vec::new(),
+            pairs: counts
+                .into_iter()
+                .map(|((rule_id, path), count)| baseline::BaselinePair {
+                    rule_id,
+                    path,
+                    count,
+                })
+                .collect(),
+        }
+    } else {
+        Baseline {
+            generated_at: Some(baseline::now_iso()),
+            entries,
+            pairs: Vec::new(),
+        }
     };
+    let findings_count = baseline.entries.len()
+        + baseline.pairs.iter().map(|p| p.count as usize).sum::<usize>();
     baseline
         .save(&baseline_path)
         .map_err(|e| (e, ExitCode::Internal))?;
     println!(
-        "recorded {} findings in {}",
-        baseline.entries.len(),
+        "recorded {} findings {} in {}",
+        findings_count,
+        if pair_mode { "as (rule, path) pairs" } else { "with per-finding identity" },
         baseline_path.display()
     );
     Ok(ExitCode::Clean)
@@ -383,14 +506,15 @@ fn todo_prune(root: &Path) -> Result<ExitCode, (String, ExitCode)> {
 fn print_help() {
     println!(
         "omni-lint {} — a framework for building fast, language-agnostic linters
-built-in plugins: graphql
+plugins: examples opt-in via --features graphql; loaded lazily from plugins/*.wasm
 
 USAGE:
-    omni-lint [COMMAND] [ROOT] [--format text|json]
+    omni-lint [COMMAND] [ROOT] [--format text|json] [--max-warnings N]
 
 COMMANDS:
     check          lint ROOT (default: .); exits 1 when fixes/findings are new
-    todo generate  record all current findings in the baseline (TODO list)
+    todo generate  record current findings in the baseline
+                   (--pairs: one (rule, path, count) budget per pair)
     todo prune     drop baseline entries for findings that no longer exist
     list-rules     list all registered rules
 

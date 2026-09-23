@@ -53,15 +53,21 @@ pub struct Config {
 }
 
 impl Config {
-    /// Find the nearest config walking up from `start`.
+    /// Find the nearest config file walking up from `start`, bounded at the
+    /// git repository root (or filesystem root) so a config from an unrelated
+    /// parent checkout cannot leak in.
     pub fn discover(start: &Path) -> Option<PathBuf> {
-        let mut dir: Option<&Path> = Some(start);
+        let mut dir: Option<PathBuf> = Some(start.to_path_buf());
         while let Some(d) = dir {
             let candidate = d.join(CONFIG_FILE_NAME);
             if candidate.is_file() {
                 return Some(candidate);
             }
-            dir = d.parent();
+            // Bounded walk: stop at the git root.
+            if d.join(".git").is_dir() || d.join(".git").is_file() {
+                return None;
+            }
+            dir = d.parent().map(|p| p.to_path_buf());
         }
         None
     }

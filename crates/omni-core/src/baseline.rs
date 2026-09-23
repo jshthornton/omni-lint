@@ -1,9 +1,29 @@
-//! Baseline ("TODO") records: stable identity + fingerprint matching.
+//! Baseline ("TODO") records. Two suppression granularities, mixable in one
+//! file:
+//!
+//! 1. **Per-finding identity** (default): rule id + path + stable subject
+//!    identity (when the plugin provides one) + a bounded context fingerprint
+//!    over the finding's span text. Line-safe; survives edits elsewhere in
+//!    the file.
+//!
+//! 2. **Pair counts** (ratchet granularity): rule id + path + a recorded
+//!    count, grouped under `pairs`. Findings fill a pair's count in order of
+//!    appearance; the excess re-flags — so a pre-existing backlog can be
+//!    recorded wholesale without hiding growth.
 
 use crate::diagnostic::{Diagnostic, Severity};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
+
+/// A per-(rule, path) suppression budget. Findings up to `count` are
+/// suppressed in order of appearance; anything beyond re-flags.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BaselinePair {
+    pub rule_id: String,
+    pub path: String,
+    pub count: u64,
+}
 
 /// One baseline entry representing an existing, "won't fix now" finding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,7 +44,13 @@ pub struct BaselineEntry {
 pub struct Baseline {
     #[serde(default)]
     pub generated_at: Option<String>,
+    /// Per-finding entries (identity granularity).
+    #[serde(default)]
     pub entries: Vec<BaselineEntry>,
+    /// Per-(rule, path) suppression budgets (ratchet granularity). Findings
+    /// fill these in order of appearance; the excess over `count` re-flags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pairs: Vec<BaselinePair>,
 }
 
 impl Baseline {
@@ -53,14 +79,19 @@ impl Baseline {
             .map_err(|e| format!("write {}: {e}", path.display()))
     }
 
-    /// Classify a fresh finding as baselined, new, or stale-consuming.
+    /// Classify a fresh finding as baselined or new.
+    ///
+    /// Identity match first (subject, then fingerprint); then a pair-count
+    /// budget if the finding's (rule, path) pair has recorded counts.
+    /// `pair_budget_left` is the mutable per-run remaining budget per pair.
     pub fn classify(
         &self,
         diag: &Diagnostic,
         path: &str,
         fingerprint: &str,
+        pair_budget_left: &mut BTreeMap<(String, String), u64>,
     ) -> BaselineMatch {
-        // First match on subject identity when available, else rule+path+fingerprint.
+        // Per-finding identity first.
         let mut chosen: Option<usize> = None;
         for (i, e) in self.entries.iter().enumerate() {
             if e.rule_id != diag.rule_id || e.path != path {
@@ -87,15 +118,29 @@ impl Baseline {
                 }
             }
         }
-        match chosen {
-            Some(i) => BaselineMatch::Baselined(i),
-            None => BaselineMatch::New,
+        if let Some(i) = chosen {
+            return BaselineMatch::Baselined(i);
         }
+        // Pair-count budget: suppress in order of appearance until the
+        // recorded count is exhausted; the excess re-flags.
+        let key = (diag.rule_id.clone(), path.to_string());
+        let left = pair_budget_left.entry(key).or_insert_with(|| {
+            self.pairs
+                .iter()
+                .find(|p| p.rule_id == diag.rule_id && p.path == path)
+                .map(|p| p.count)
+                .unwrap_or(0)
+        });
+        if *left > 0 {
+            *left -= 1;
+            return BaselineMatch::Baselined(usize::MAX);
+        }
+        BaselineMatch::New
     }
 }
 
 pub enum BaselineMatch {
-    /// An existing TODO covered this finding.
+    /// An existing TODO covered this finding (entry index; MAX for pair).
     Baselined(usize),
     /// Finding is not in the baseline: report it.
     New,
@@ -130,6 +175,7 @@ pub fn build_baseline(
                 },
             )
             .collect(),
+        pairs: Vec::new(),
     }
 }
 
@@ -146,7 +192,62 @@ pub fn prune_baseline(
     baseline
 }
 
-/// Handy totals for reporting.
+/// Hard limit on findings a single diagnostic may carry.
+const MAX_RELATED: usize = 32;
+
+/// Scan `source` for suppression markers. Generic across domains: any comment
+/// (line starts with `#` or `//` after indent) containing
+/// `omni-lint-disable-next-line` [optional space- or comma-separated rule ids]
+/// suppresses every finding on the following line. `all` suppresses every
+/// rule. Returns line (1-based) -> rule ids ('all' = empty set meaning all).
+pub fn parse_suppress_markers(source: &str) -> BTreeMap<u32, std::collections::BTreeSet<String>> {
+    let mut out: BTreeMap<u32, std::collections::BTreeSet<String>> = BTreeMap::new();
+    let lines: Vec<&str> = source.lines().collect();
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed
+            .strip_prefix("#")
+            .or_else(|| trimmed.strip_prefix("//"))
+        else {
+            continue;
+        };
+        let Some(rest) = rest
+            .trim_start()
+            .strip_prefix("omni-lint-disable-next-line")
+        else {
+            continue;
+        };
+        let target_line = (idx + 2) as u32; // 1-based following line
+        let ids: std::collections::BTreeSet<String> = rest
+            .trim()
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        out.entry(target_line).or_default().extend(ids);
+        if out.len() > 10_000 {
+            break;
+        }
+    }
+    let _ = MAX_RELATED;
+    out
+}
+
+/// Is a finding on `line` suppressed for `rule_id`?
+pub fn is_suppressed(
+    line: u32,
+    rule_id: &str,
+    markers: &BTreeMap<u32, std::collections::BTreeSet<String>>,
+) -> bool {
+    if markers.is_empty() {
+        return false;
+    }
+    match markers.get(&line) {
+        None => false,
+        Some(rules) => rules.is_empty() || rules.contains(rule_id),
+    }
+}
+
 pub fn count_severities(items: &[Reportable]) -> BTreeMap<Severity, usize> {
     let mut m = BTreeMap::new();
     for r in items {

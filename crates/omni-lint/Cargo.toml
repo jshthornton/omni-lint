@@ -8,12 +8,22 @@ license.workspace = true
 name = "omni-lint"
 path = "src/main.rs"
 
+[features]
+# The GraphQL example plugin is NOT part of the default package: the CLI
+# ships as a pure framework. Enable to embed the first-party example:
+#   cargo build -p omni-lint --features graphql
+default = []
+graphql = ["dep:omni-graphql"]
+
 [dependencies]
 omni-core.workspace = true
-omni-graphql.workspace = true
+omni-graphql = { workspace = true, optional = true }
 omni-wasm.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 rayon.workspace = true
 globset.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -277,10 +277,33 @@ pub fn run_check(root: &Path, config: &Config, registry: &Registry) -> Result<Ru
             .cmp(&(&b.path, b.located.line, b.located.column, &b.diag.rule_id))
     });
 
+    // Inline suppression: `omni-lint-disable-next-line [rule ids]` comments.
+    // Generic across plugins; parse errors are never suppressible.
+    let mut marker_cache: BTreeMap<String, BTreeMap<u32, std::collections::BTreeSet<String>>> =
+        BTreeMap::new();
+    reportables.retain(|r| {
+        if r.diag.rule_id.ends_with("/parse-error") {
+            return true;
+        }
+        let markers = marker_cache
+            .entry(r.path.clone())
+            .or_insert_with(|| {
+                sources_by_id
+                    .values()
+                    .find(|s| s.path.display().to_string() == r.path)
+                    .map(|s| crate::baseline::parse_suppress_markers(s.text()))
+                    .unwrap_or_default()
+            });
+        !crate::baseline::is_suppressed(r.located.line, &r.diag.rule_id, markers)
+    });
+    let suppressed_inline = 0usize;
+    let _ = suppressed_inline;
+
     // Baseline classification: subject/fingerprint identity match.
     let mut new_findings = Vec::new();
     let mut baselined = 0usize;
     let cloned_baseline = baseline.clone();
+    let mut pair_budget: BTreeMap<(String, String), u64> = BTreeMap::new();
     for r in reportables {
         if let Some(b) = &cloned_baseline {
             let fp = fingerprint(
@@ -288,7 +311,7 @@ pub fn run_check(root: &Path, config: &Config, registry: &Registry) -> Result<Ru
                 r.diag.span,
                 r.diag.subject.as_deref(),
             );
-            if let BaselineMatch::Baselined(_) = b.classify(&r.diag, &r.path, &fp) {
+            if let BaselineMatch::Baselined(_) = b.classify(&r.diag, &r.path, &fp, &mut pair_budget) {
                 baselined += 1;
                 continue;
             }
@@ -363,6 +386,7 @@ pub fn prune(baseline: Baseline, live: &BTreeSet<(String, String, Option<String>
     let mut kept = Baseline {
         generated_at: baseline.generated_at.clone(),
         entries: Vec::new(),
+        pairs: baseline.pairs.clone(),
     };
     for e in baseline.entries.iter().cloned() {
         let key = (
