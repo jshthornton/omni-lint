@@ -1,0 +1,9 @@
+[package]
+name = "omni-guest"
+version.workspace = true
+edition.workspace = true
+description = "Guest-side SDK for omni-lint WASM modules: allocator, contract I/O, facts and finding types"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

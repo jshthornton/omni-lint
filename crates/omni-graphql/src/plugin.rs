@@ -1,5 +1,12 @@
-//! The GraphQL domain plugin: parses `.graphql`/`.gql` files, exposes
-//! `graphql.ast` (file) and `graphql.schema` (workspace), registers rules.
+//! The GraphQL language plugin: parses `.graphql`/`.gql` files and exposes
+//! the AST and facts capabilities. Pure AST provider — rules are separate
+//! units (native in `rules/`, or independent WASM rule modules).
+//!
+//! Capabilities:
+//!   - `graphql.ast` (file)      — typed `Document` (native rules)
+//!   - `graphql.facts` (file)    — JSON facts view (WASM rules)
+//!   - `graphql.schema` (wks)    — typed `SchemaModel` (native rules)
+//!   - `graphql.workspace` (wks) — JSON cross-file facts (WASM rules)
 
 use crate::ast::Document;
 use crate::model::SchemaModel;
@@ -18,7 +25,7 @@ impl Plugin for GraphqlPlugin {
     }
 
     fn describe(&self) -> &'static str {
-        "GraphQL SDL parser and schema model (crate omni-graphql)"
+        "GraphQL SDL parser, AST and facts model (crate omni-graphql)"
     }
 
     fn extensions(&self) -> &'static [&'static str] {
@@ -32,7 +39,15 @@ impl Plugin for GraphqlPlugin {
                 scope: CapabilityScope::File,
             },
             Capability {
+                name: "graphql.facts",
+                scope: CapabilityScope::File,
+            },
+            Capability {
                 name: "graphql.schema",
+                scope: CapabilityScope::Workspace,
+            },
+            Capability {
+                name: "graphql.workspace",
                 scope: CapabilityScope::Workspace,
             },
         ]
@@ -46,6 +61,9 @@ impl Plugin for GraphqlPlugin {
         // The lexer/parser report at most a bounded number of errors per file.
         errors.truncate(50);
         let mut artifacts: BTreeMap<String, Arc<dyn Any + Send + Sync>> = BTreeMap::new();
+        // JSON facts view first: the surface third-party WASM rules consume.
+        let facts = crate::facts::file_facts(&doc);
+        artifacts.insert("graphql.facts".to_string(), Arc::new(facts));
         artifacts.insert("graphql.ast".to_string(), Arc::new(doc));
         ParsedFile {
             source,
@@ -71,7 +89,13 @@ impl Plugin for GraphqlPlugin {
             })
             .collect();
         let model: SchemaModel = crate::model::build_model(&docs);
+        let path_of: BTreeMap<omni_core::SourceId, String> = files
+            .iter()
+            .map(|f| (f.source.id, f.source.path.display().to_string()))
+            .collect();
         let mut out: BTreeMap<String, Arc<dyn Any + Send + Sync>> = BTreeMap::new();
+        let workspace_facts = crate::facts::workspace_facts(&model, &path_of);
+        out.insert("graphql.workspace".to_string(), Arc::new(workspace_facts));
         out.insert("graphql.schema".to_string(), Arc::new(model));
         Ok(out)
     }

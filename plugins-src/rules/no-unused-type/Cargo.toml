@@ -1,0 +1,11 @@
+[package]
+name = "rule-no-unused-type"
+version.workspace = true
+edition.workspace = true
+description = "Example omni-lint rule module: demo-gql/no-unused-type (cross-file model consumer)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+omni-guest.workspace = true

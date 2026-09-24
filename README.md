@@ -1,30 +1,43 @@
 # omni-lint
 
-A fast, language-agnostic **framework for building linters**, in Rust. It owns the reusable machinery of tools like RuboCop, ESLint, Credo, and kube-linter — CLI, config, rule scheduling, diagnostics, TODO baselines, and reporting — so a new linter is just a *domain plugin + rules*.
+A fast, language-agnostic **framework for building linters**, in Rust. It owns the reusable machinery of tools like RuboCop, ESLint, Credo, and kube-linter — CLI, config, rule scheduling, diagnostics, TODO baselines, and reporting — so a new linter is just a *language plugin + rules*:
+
+- A **language plugin** is a pure **AST provider**: it parses a language and
+  publishes an AST plus a JSON *facts* view. It contains **no rules**.
+- A **rule** is one independently authored unit. Rules join a ruleset **à la
+  carte** — exactly like adding an entry to ESLint's `rules` map: write one
+  rule, register it (or drop its `.wasm` in `rules/`), tune it in config.
+- Nothing in the core is language-specific. Rules target a facts vocabulary
+  (`graphql.facts`, ...), not a parser, so any AST provider for a language
+  runs with any rule set for it.
 
 Design background: `docs/brainstorms/2026-09-22-omni-lint-design.md`.
 
 ```text
-CLI/config ──> discovery ──> parse plugins ──> workspace models
+CLI/config ──> discovery ──> language plugins (AST + facts)
                               │
-                   rule scheduler ──> diagnostics
+              ruleset (native rules + rules/*.wasm) ──> diagnostics
                               │
                      TODO baseline ──> formatter + exit codes
 ```
 
-## The built-in GraphQL plugin proves the seams
+## The built-in GraphQL example proves the seams
 
-`omni-graphql` parses `.graphql`/`.gql` SDL, links definitions across files into a schema model, and contributes 7 rules. Playing a second role: writing this plugin took no changes to `omni-core` and none to the CLI.
+`omni-graphql` is a language plugin: it parses `.graphql`/`.gql` SDL, links
+definitions across files into a schema model, and publishes `graphql.facts`
+(JSON) alongside its typed AST. Its 7 example rules live in
+`crates/omni-graphql/src/rules/` — **one file per rule**, each a standalone
+unit you can register alone.
 
-| Rule | Scope | Default |
+| Rule | Reads | Default |
 |---|---|---|
-| `graphql/no-empty-type` | file | error |
-| `graphql/type-name-pascal` | file | warning |
-| `graphql/field-name-camel` | file | warning |
-| `graphql/deprecated-required-input` | workspace | error |
-| `graphql/no-undefined-type` | workspace | error |
-| `graphql/duplicate-type` | workspace | error |
-| `graphql/no-unused-type` | workspace | info (suppressed without a `schema` block) |
+| `graphql/no-empty-type` | `graphql.ast` | error |
+| `graphql/type-name-pascal` | `graphql.ast` | warning |
+| `graphql/field-name-camel` | `graphql.ast` | warning |
+| `graphql/deprecated-required-input` | `graphql.schema` | error |
+| `graphql/no-undefined-type` | `graphql.schema` | error |
+| `graphql/duplicate-type` | `graphql.schema` | error |
+| `graphql/no-unused-type` | `graphql.schema` | info (suppressed without a `schema` block) |
 
 ## Usage
 
@@ -37,7 +50,7 @@ omni-lint todo prune [ROOT]      # drop baseline entries for fixed findings
 omni-lint list-rules
 ```
 
-Exit codes: `0` clean (or all findings baselined), `1` findings, `2` config/UI error, `3` internal failure. Parse failures surface as `graphql/parse-error` findings, never a crash.
+Exit codes: `0` clean (or all findings baselined), `1` findings, `2` config/UI error, `3` internal failure. Parse failures surface as `<plugin>/parse-error` findings, never a crash.
 
 ### Config (`omni-lint.toml`, discovered upward from the lint root)
 
@@ -45,6 +58,9 @@ Exit codes: `0` clean (or all findings baselined), `1` findings, `2` config/UI e
 [rules."graphql/no-empty-type"]
 enabled = true            # false disables; a severity string also enables
 severity = "error"        # optional override
+
+[rules."acme/no-foo".options]      # rule options, handed to the rule
+allow_names = ["id", "guid"]
 
 [targets]
 extensions = ["graphql"]  # narrow discovery to these extensions
@@ -58,52 +74,113 @@ strict_mode = true
 
 ### TODO baselines
 
-Findings match baseline entries by **stable subject identity** when the plugin provides one (`type:User.field:name`), else by a bounded **context fingerprint** (span text), not line numbers — so files shift without leaking "new" findings. A committed baseline makes an existing codebase pass while new violations still fail.
+Findings match baseline entries by **stable subject identity** when the rule provides one (`type:User.field:name`), else by a bounded **context fingerprint** (span text), not line numbers — so files shift without leaking "new" findings. A committed baseline makes an existing codebase pass while new violations still fail. Inline `# omni-lint-disable-next-line rule-id` markers suppress per line.
 
-## Writing a plugin (v1: compile-time crate)
+## Writing a rule (the ESLint story)
 
-1. Implement `omni_core::plugin::Plugin` — id, extensions, capabilities
-   (`graphql.ast` file-scoped, `graphql.schema` workspace-scoped), `parse_file`
-   producing typed artifacts, optional `build_workspace`.
-2. Implement `omni_core::plugin::Rule` per rule: metadata plus a `run` that
-   downcasts artifacts and reports `Diagnostic`s with byte-offset `Span`s and
-   (optionally) stable subject strings.
-3. Register both in a `Registry` from `crates/omni-lint/src/main.rs::registry()`.
-4. Recover, don't crash: parse errors are diagnostics.
+A rule is one file. Two flavours:
 
-The engine guarantees: each file is parsed **once** (parallel), workspace models are built **only** when an enabled rule needs them, diagnostics are re-located to line/column by the host, and output is deterministic.
+**1. One-rule WASM module** — author anywhere, ship one `.wasm`, no engine
+changes, no registry edits: drop it in `<config dir>/rules/` and it joins the
+ruleset. Copy `plugins-src/rules/no-empty-type/` and change two functions:
 
-## Sandboxed WASM plugins (third-party)
+```rust
+use omni_guest::{write_findings, Finding, RuleEnvelope};
 
-Plugins load **at runtime** from `<config dir>/plugins/*.wasm` — third-party authors ship one `.wasm` file plus nothing else; they never contribute to this repo.
+#[no_mangle]
+pub extern "C" fn omni_rule_meta() -> i32 {
+    omni_guest::write_json(r#"{
+  "id": "acme/no-empty-type",
+  "description": "Types must not be empty.",
+  "severity": "error",
+  "requires": "graphql.facts"
+}"#)
+}
+
+#[no_mangle]
+pub extern "C" fn omni_rule_run(ptr: i32, len: i32) -> i32 {
+    let envelope = RuleEnvelope::read(ptr, len);   // files[{path, source, facts}], workspace, options
+    let findings = envelope.files.iter().flat_map(|f| {
+        f.facts.defs.iter().filter(|d| d.fields.is_empty())
+            .map(|d| Finding::at(f.path.clone(), format!("`{}` is empty", d.name), d.span)
+                .subject(d.subject.clone()))
+    }).collect::<Vec<_>>();
+    write_findings(&findings)                       // or stream with omni_guest::report()
+}
+```
 
 ```sh
-# Author a plugin in any language that targets wasm32-wasip1 (Rust, TinyGo,
-# Swift/AssemblyScript by hand, etc):
-cargo build --release --target wasm32-wasip1   # in plugins-src/demo-graphql-plugin
-cp target/wasm32-wasip1/release/demo_graphql_plugin.wasm <project>/plugins/
+cargo build --release --target wasm32-wasip1    # in your rule crate
+cp target/wasm32-wasip1/release/acme_no_empty_type.wasm <project>/rules/
 ```
 
-Route files to it with config when a first-party plugin claims the same extension:
+`requires` names the facts the rule reads: `<language>.facts` (per-file) or
+`<language>.workspace` (cross-file model; negotiated at run time — a rule
+needing it is skipped when no language module provides one). Findings carry
+`{message, span: [start, end] bytes, path, severity?, subject?}`; the engine
+re-locates byte offsets to line/column, applies suppression markers,
+baselines, severity overrides and `--max-warnings` uniformly.
 
-```toml
-prefer = "demo-gql"   # plugin id from its metadata
-```
+**2. Native Rust rule** — implement `omni_core::Rule` (see
+`crates/omni-graphql/src/rules/no_empty_type.rs`) and register just that rule
+in your embedded `Registry` (`register_rule` rejects duplicate ids). Native
+rules can downcast typed AST artifacts (`graphql.ast`, `graphql.schema`);
+WASM rules consume the JSON facts either way.
 
-**Contract** (a guest is a classic wasm32-wasip1 module):
+The `omni-guest` SDK (`plugins-src/omni-guest/`) gives rule authors the
+allocator, contract framing, facts/finding types and options plumbing for
+free. A complete rule is ~40 lines — the four in `plugins-src/rules/` cover
+file scope, cross-file folds, streaming reports, the workspace model, and
+options from config.
+
+## Writing a language plugin
+
+A language plugin parses and publishes capabilities; it never bundles rules.
+
+**Native (Rust):** implement `omni_core::plugin::Plugin` — id, extensions,
+capabilities, `parse_file` producing artifacts, optional `build_workspace`.
+Publish both a typed AST artifact (for native rules) and the JSON facts under
+`<language>.facts` (see `omni-graphql/src/facts.rs`) and every third-party
+WASM rule for your language works out of the box.
+
+**WASM language module** (`<config dir>/plugins/*.wasm`): converts any parser
+into a plug-in language.
 
 | Export | Meaning |
 |---|---|
 | `memory` | linear memory |
 | `omni_alloc(len) -> ptr` | give the host a buffer to copy bytes into |
-| `omni_plugin_meta() -> ptr` | `[len: u32 LE][json]` — `{id, name, extensions, capabilities, rules}` |
-| `omni_plugin_parse(path_ptr, path_len, src_ptr, src_len) -> ptr` | `[len][json]` facts for one file; file rules report via `omni_report` |
-| `omni_plugin_run_workspace(facts_ptr, facts_len) -> ptr` | `[len][json array of findings]` cross-file pass |
+| `omni_plugin_meta() -> ptr` | `[len: u32 LE][json]` — `{id, name, extensions, capabilities}` (e.g. `graphql.facts` file, `graphql.workspace` workspace) |
+| `omni_plugin_parse(path_ptr, path_len, src_ptr, src_len) -> ptr` | `[len][json]` facts document (+ `errors` array) for one file |
+| `omni_plugin_workspace(ptr, len) -> ptr` *(optional)* | `[len][json]` cross-file model over `{"files": [{path, facts}]}`; omit it and the host synthesizes the merged facts automatically |
 
-Host imports the guest can call: `env.omni_report(ptr, len)` (finding: `{rule_id, severity, message, span: [start, end], subject?}`) and `env.omni_parse_error(ptr, len)`.
+**Facts vocabulary** (`<language>.facts`, consumed by every rule):
+`{defs: [{kind, name, span, subject, fields: [{name, span, type_name, required, directives, subject}], implements, union_members, enum_values, directives}], uses: [{name, span}], directives_defined, directives_used, has_entry_block, roots}` — the workspace view adds a `path` to every `def`/`use`.
 
-**Sandbox guarantees:** fuel metered (5B ticks/call default, tunable via `plugins/limits.toml`), no filesystem/network (WASI linked with nothing granted), 100k-findings and 64 MB-payload caps, guest spans clamped. A plugin that traps or lies never crashes the engine — it surfaces as a config diagnostic.
+Host imports a guest may call: `env.omni_report(ptr, len)` (one finding JSON)
+and `env.omni_parse_error(ptr, len)`. Frame: every string-returning export is
+`[len: u32 LE][bytes]`.
 
-**Costs, measured** (40 SDL files × 50 types, release CLI): native plugin ≈ 12 ms; wasm plugin ≈ 207 ms for the same tree. The sandbox overhead is dominated by per-call instantiation + JSON serialization — the order-of-magnitude number is real, and per-file overhead in a lint-scale run is milliseconds. See the design doc for the optimization levers.
+Both module kinds share the same **sandbox**: fuel metered (5B ticks/call
+default, tunable via `plugins/limits.toml` / `rules/limits.toml`), no
+filesystem/network (WASI linked with nothing granted), 100k-findings and
+64 MB-payload caps, guest spans clamped. A module that traps or lies never
+crashes the engine — it surfaces as a load warning and is skipped.
 
-A complete, working example lives in `plugins-src/demo-graphql-plugin/` (Rust, no_std-ish, hand-rolled bump allocator over `memory.grow`): facts about types it scans, rules for empty/undefined/duplicate/unused types, JSON report — the same fixture lints identically whether the plugin is native or WASM. Do read that contract test as the third-party story's proof: `tests/fixtures/wasm-plugin/`.
+**Costs, measured** (40 SDL files × 50 types, release CLI): native plugin ≈ 12 ms; WASM modules ≈ 207 ms for the same tree. The sandbox overhead is dominated by per-call instantiation + JSON serialization — the order-of-magnitude number is real, and per-file overhead in a lint-scale run is milliseconds. See the design doc for the optimization levers.
+
+Working examples live in `plugins-src/`: `demo-graphql-ast/` (a sandboxed AST
+module, no rules) and `rules/*` (four one-rule modules). The same fixture
+lints identically through the native example pack or the WASM modules — see
+`tests/fixtures/wasm-plugin/`.
+
+## Layout
+
+```
+crates/omni-core      engine: config, discovery, scheduling, diagnostics, baselines, report
+crates/omni-graphql   example language plugin + one-file-per-rule examples
+crates/omni-wasm      sandboxed WASM loading: language modules + one-rule modules
+crates/omni-lint      CLI (check / todo generate / todo prune / list-rules)
+plugins-src/          guest SDK + demo language module + demo rule modules
+plugins/, rules/      drop-in dirs for third-party .wasm modules
+```

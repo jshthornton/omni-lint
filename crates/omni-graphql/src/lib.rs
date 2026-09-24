@@ -1,4 +1,5 @@
 mod ast;
+pub mod facts;
 mod lexer;
 mod model;
 pub mod parser;

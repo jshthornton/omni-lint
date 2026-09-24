@@ -4,11 +4,9 @@ use omni_core::baseline::{self, Baseline};
 use omni_core::config::Config;
 use omni_core::report::{format_text, write_json, OutputFormat};
 use omni_core::runner::{run_check, ExitCode};
-use omni_core::{Plugin, Registry};
+use omni_core::Registry;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "graphql")]
-use std::sync::Arc;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -167,8 +165,11 @@ fn run(args: &[String]) -> Result<ExitCode, (String, ExitCode)> {
             let registry = registry_for(Some(&cfg));
             for m in registry.rule_meta() {
                 println!(
-                    "{}: {} (default severity: {})",
-                    m.id, m.description, m.default_severity
+                    "{}: {} (default severity: {}, reads: {})",
+                    m.id,
+                    m.description,
+                    m.default_severity,
+                    if m.requires.is_empty() { "-" } else { m.requires }
                 );
             }
             Ok(ExitCode::Clean)
@@ -201,93 +202,75 @@ fn run(args: &[String]) -> Result<ExitCode, (String, ExitCode)> {
 }
 
 fn build_registry(repo: &mut Registry) {
-    // Example plugin packs are opt-in at build time, NOT part of the default
-    // package: the framework ships rule-free (see README); third-party packs
-    // load at runtime from plugins/*.wasm.
+    // Example language plugins + rule packs are opt-in at build time, NOT
+    // part of the default package: the framework ships rule-free (see
+    // README). Third-party language modules load from plugins/*.wasm and
+    // third-party rules from rules/*.wasm — one rule per module.
     #[cfg(feature = "graphql")]
     {
-        repo.register(Arc::new(omni_graphql::GraphqlPlugin), omni_graphql::rules::all_rules());
+        repo.register_plugin(std::sync::Arc::new(omni_graphql::GraphqlPlugin));
+        for err in repo.register_rules(omni_graphql::rules::all_rules()) {
+            eprintln!("warning: {err}");
+        }
     }
     #[cfg(not(feature = "graphql"))]
     {
-        // Rule-free framework build: nothing registered here. Third-party
-        // packs load at runtime from plugins/*.wasm (see registry_for).
+        // Rule-free framework build: nothing registered here.
         let _ = repo;
     }
 }
 
-
-
-/// Native plugins + any `.wasm` plugins found under `<config dir>/plugins/`.
-/// A third-party module that fails validation degrades to a load error on
-/// that plugin (surfaced by the runner as a config-severity warning) instead
-/// of bricking the whole run.
+/// Native plugins + `.wasm` language modules under `<config dir>/plugins/` +
+/// `.wasm` rule modules under `<config dir>/rules/` (one rule each — this is
+/// the "write your own rule and drop it in" path, like adding an eslint
+/// rule). A third-party module that fails validation degrades to a load
+/// warning and is skipped instead of bricking the whole run.
 fn registry_for(config: Option<&omni_core::config::Config>) -> Registry {
     let mut r = Registry::new();
     build_registry(&mut r);
     if let Some(cfg) = config {
+        // Language AST modules.
         let plugins_dir = cfg.dir.join("plugins");
         if plugins_dir.is_dir() {
             let limits = load_wasm_limits(&plugins_dir);
             let (wasm_plugins, errors) = omni_wasm::WasmPlugin::discover(&plugins_dir, limits);
             for (path, err) in errors {
-                eprintln!("warning: plugin {} failed to load: {err}", path.display());
+                eprintln!("warning: language module {} failed to load: {err}", path.display());
             }
             for plugin in wasm_plugins {
-                if let Some(err) = plugin.load_error() {
-                    eprintln!(
-                        "warning: plugin {} unusable: {err}",
-                        plugin.module_path().display()
-                    );
-                    continue;
+                r.register_plugin(std::sync::Arc::new(plugin));
+            }
+        }
+        // Rule modules: registered à la carte into the one ruleset.
+        let rules_dir = cfg.dir.join("rules");
+        if rules_dir.is_dir() {
+            let limits = load_wasm_limits(&rules_dir);
+            let (wasm_rules, errors) = omni_wasm::WasmRule::discover(&rules_dir, limits);
+            for (path, err) in errors {
+                eprintln!("warning: rule module {} failed to load: {err}", path.display());
+            }
+            for rule in wasm_rules {
+                if let Err(e) = r.register_rule(std::sync::Arc::new(rule)) {
+                    eprintln!("warning: {e}");
                 }
-                let mut rules: Vec<std::sync::Arc<dyn omni_core::Rule>> = Vec::new();
-                if let Some(meta) = plugin.meta() {
-                    for rule in &meta.rules {
-                        rules.push(std::sync::Arc::new(omni_wasm::MetaOnlyRule::new(
-                            omni_core::plugin::RuleMeta {
-                                id: leak_static(&rule.id),
-                                description: leak_static(&rule.description),
-                                default_severity: rule
-                                    .severity
-                                    .as_deref()
-                                    .and_then(omni_core::Severity::parse)
-                                    .unwrap_or(omni_core::Severity::Warning),
-                                // findings arrive via the plugin itself
-                                requires: "",
-                            },
-                        )));
-                    }
-                }
-                let plugin_arc: std::sync::Arc<dyn Plugin> = std::sync::Arc::new(plugin);
-                r.register(plugin_arc, rules);
             }
         }
     }
     r
 }
 
-fn leak_static(s: &str) -> &'static str {
-    Box::leak(s.to_string().into_boxed_str())
-}
-
-/// Optional `plugins/limits.toml`: per-module fuel tweaks.
+/// Optional `plugins/limits.toml` or `rules/limits.toml`: fuel tweaks for
+/// the modules in that directory.
 /// ```toml
-/// [limits."my-plugin.wasm"]
 /// fuel = 10_000_000_000
 /// ```
-fn load_wasm_limits(plugins_dir: &Path) -> omni_wasm::WasmLimits {
-    let path = plugins_dir.join("limits.toml");
-    let _ = &path;
+fn load_wasm_limits(dir: &Path) -> omni_wasm::WasmLimits {
+    let path = dir.join("limits.toml");
     let mut default = omni_wasm::WasmLimits { fuel: Some(omni_wasm::DEFAULT_FUEL) };
     if let Ok(text) = std::fs::read_to_string(&path) {
         if let Ok(raw) = toml::from_str::<toml::Table>(&text) {
-            // A global default without named section is fine too.
             if let Some(fuel) = raw.get("fuel").and_then(|v| v.as_integer()) {
                 default.fuel = Some(fuel.max(0) as u64);
-            }
-            if let Some(section) = raw.get("limits") {
-                let _ = section; // per-module overrides land with a config rewrite
             }
         }
     }
@@ -303,9 +286,9 @@ fn config_for(root: &Path) -> Result<Config, (String, ExitCode)> {
 fn check(root: &Path, format: OutputFormat, max_warnings: Option<usize>) -> Result<ExitCode, (String, ExitCode)> {
     let cfg = config_for(root)?;
     let registry = registry_for(Some(&cfg));
-    if registry.plugins.is_empty() {
+    if registry.plugins.is_empty() && registry.rules().is_empty() {
         eprintln!(
-            "warning: no lint plugins loaded. Install example packs (cargo build -p omni-lint --features graphql) or drop .wasm modules in <config dir>/plugins/."
+            "warning: no language plugins or rules loaded. Enable example packs (cargo build -p omni-lint --features graphql), drop language modules in <config dir>/plugins/, or drop your own rule modules in <config dir>/rules/."
         );
     }
 
@@ -506,7 +489,9 @@ fn todo_prune(root: &Path) -> Result<ExitCode, (String, ExitCode)> {
 fn print_help() {
     println!(
         "omni-lint {} — a framework for building fast, language-agnostic linters
-plugins: examples opt-in via --features graphql; loaded lazily from plugins/*.wasm
+plugins: language AST modules in plugins/*.wasm (no rules inside);
+         rules: one-rule modules in rules/*.wasm, added to the ruleset a la carte
+         (example packs opt-in via --features graphql)
 
 USAGE:
     omni-lint [COMMAND] [ROOT] [--format text|json] [--max-warnings N]
@@ -516,7 +501,7 @@ COMMANDS:
     todo generate  record current findings in the baseline
                    (--pairs: one (rule, path, count) budget per pair)
     todo prune     drop baseline entries for findings that no longer exist
-    list-rules     list all registered rules
+    list-rules     list the assembled ruleset
 
 CONFIG:
     omni-lint.toml at the lint root; see README for its schema",

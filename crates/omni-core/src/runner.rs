@@ -1,5 +1,7 @@
 //! Run orchestration: discover -> parse (parallel, once per file) ->
-//! negotiate capabilities -> run rules -> classify against baseline -> report.
+//! negotiate capabilities -> run the ruleset -> classify against baseline ->
+//! report. Rules are independent units selected in config; plugins only
+//! parse.
 
 use crate::baseline::{Baseline, BaselineEntry, BaselineMatch, Reportable};
 use crate::config::{Config, RuleDirective};
@@ -194,13 +196,18 @@ pub fn run_check(root: &Path, config: &Config, registry: &Registry) -> Result<Ru
             }
             collected.lock().unwrap().push(diag);
         };
-        let ctx = crate::plugin::RuleContext::new(&parsed, &workspace, &emit);
+        let options = config
+            .options
+            .get(meta.id)
+            .and_then(|t| serde_json::to_value(t).ok());
+        let ctx = crate::plugin::RuleContext::new(&parsed, &workspace, &emit).with_options(options);
         rule.run(&ctx);
     }
     let mut diagnostics: Vec<Diagnostic> = collected.into_inner().unwrap();
 
-    // Plugin-reported file-scope findings (WASM plugins run their file rules
-    // inside parse). Config severity overrides apply when the rule is known.
+    // Plugin-reported parse-time findings (parse diagnostics from plugin
+    // authors, not rules). Config severity overrides apply when the id is
+    // known to the ruleset.
     for p in &parsed {
         for mut f in p.findings.clone() {
             if config.rules.get(&f.rule_id) == Some(&RuleDirective::Off) {
@@ -210,43 +217,6 @@ pub fn run_check(root: &Path, config: &Config, registry: &Registry) -> Result<Ru
                 f.severity = *sev;
             }
             diagnostics.push(f);
-        }
-    }
-
-    // Plugin-specific workspace rules (WASM). Findings carry relative paths;
-    // resolve them against discovered sources.
-    let path_to_id: BTreeMap<String, SourceId> = sources
-        .iter()
-        .map(|s| (s.path.display().to_string(), s.id))
-        .collect();
-    // Plugins that declare workspace capabilities get their workspace pass
-    // invoked; guests consult the enabled-rules envelope to prune themselves.
-    let workspace_wanted: HashSet<String> = chosen
-        .iter()
-        .filter(|p| p.capabilities().iter().any(|c| c.scope == CapabilityScope::Workspace))
-        .map(|p| p.id().to_string())
-        .collect();
-    for plugin in &chosen {
-        if !workspace_wanted.contains(plugin.id()) {
-            continue;
-        }
-        for pd in plugin.run_workspace_rules(&parsed) {
-            if config.rules.get(&pd.diag.rule_id) == Some(&RuleDirective::Off) {
-                continue;
-            }
-            let source_id = path_to_id.get(&pd.path).copied().unwrap_or_else(|| {
-                // Unknown path: use the first source so the location still
-                // renders; the path stays visible in the message.
-                sources.first().map(|s| s.id).unwrap_or(SourceId(0))
-            });
-            let mut d = pd.diag.into_diagnostic(source_id);
-            if pd.path.is_empty() {
-                d.severity = crate::Severity::Error;
-            }
-            if let Some(sev) = severity_by_rule.get(&d.rule_id) {
-                d.severity = *sev;
-            }
-            diagnostics.push(d);
         }
     }
 

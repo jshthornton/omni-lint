@@ -6,16 +6,17 @@
 //!    default — the shipped package is a rule-free framework). These tests
 //!    mutate the sample fixture, so they hold a shared lock.
 //!
-//! 2. A third-party **WASM plugin** (self-contained: the plugin bytes live
+//! 2. Third-party **WASM modules** — a language AST module (plugins/) plus
+//!    one-rule modules (rules/), each self-contained: the module bytes live
 //!    in-repo; each test builds its own scratch project directory so tests
-//!    never share config/baseline state and run in parallel safely).
+//!    never share config/baseline state and run in parallel safely.
 
 #[cfg(feature = "graphql")]
 use omni_core::config::Config;
 #[cfg(feature = "graphql")]
 use omni_core::runner::run_check;
 #[cfg(feature = "graphql")]
-use omni_core::{Plugin, Registry};
+use omni_core::Registry;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "graphql")]
 use std::sync::Arc;
@@ -28,11 +29,28 @@ struct Scratch {
 
 impl Scratch {
     fn new(name: &str, config: &str) -> Scratch {
+        Scratch::with_rules(
+            name,
+            config,
+            &[
+                "rule_no_empty_type.wasm",
+                "rule_no_undefined_type.wasm",
+                "rule_duplicate_type.wasm",
+                "rule_no_unused_type.wasm",
+            ],
+        )
+    }
+
+    /// Scratch project with only the named rule modules in `rules/` — rules
+    /// join the ruleset a la carte, like dropping an entry into eslint's
+    /// `rules` map.
+    fn with_rules(name: &str, config: &str, rules: &[&str]) -> Scratch {
         let base = std::env::temp_dir()
             .join(format!("omni-lint-e2e-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("schema")).unwrap();
         std::fs::create_dir_all(base.join("plugins")).unwrap();
+        std::fs::create_dir_all(base.join("rules")).unwrap();
         // strip fixture
         std::fs::write(
             base.join("schema/user.graphql"),
@@ -46,11 +64,16 @@ impl Scratch {
         )
         .unwrap();
         std::fs::write(base.join("omni-lint.toml"), config).unwrap();
+        // Language AST module (parses GraphQL, contains no rules).
         std::fs::copy(
             wasm_module_in_repo(),
             base.join("plugins/omni-wasm-test-plugin.wasm"),
         )
         .unwrap();
+        // One-rule modules, a la carte.
+        for rule in rules {
+            std::fs::copy(rule_module_in_repo(rule), base.join("rules").join(rule)).unwrap();
+        }
         Scratch { root: base }
     }
 }
@@ -63,9 +86,17 @@ impl Drop for Scratch {
 
 fn wasm_module_in_repo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/wasm-plugin/plugins/demo_graphql_plugin.wasm")
+        .join("../../tests/fixtures/wasm-plugin/plugins/demo_graphql_ast.wasm")
         .canonicalize()
-        .expect("wasm plugin fixture exists")
+        .expect("wasm language fixture exists")
+}
+
+fn rule_module_in_repo(file: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/wasm-plugin/rules")
+        .join(file)
+        .canonicalize()
+        .expect("wasm rule fixture exists")
 }
 
 fn scratch_exe() -> &'static str {
@@ -119,6 +150,17 @@ fn run(subcmd: &str, root: &Path) -> (i32, String) {
 fn check(root: &Path) -> omni_core::runner::RunResult {
     let cfg = Config::load(root).expect("config loads");
     run_check(root, &cfg, &registry()).expect("check succeeds")
+}
+
+/// Registry for the native example pack: one language plugin + its rules
+/// registered à la carte (this is exactly what a consumer embeds).
+#[cfg(feature = "graphql")]
+fn registry() -> Registry {
+    let mut r = Registry::new();
+    r.register_plugin(Arc::new(omni_graphql::GraphqlPlugin));
+    let errors = r.register_rules(omni_graphql::rules::all_rules());
+    assert!(errors.is_empty(), "rule registration failed: {errors:?}");
+    r
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +302,7 @@ fn wasm_plugin_rules_are_listed() {
         "demo-gql/no-empty-type",
         "demo-gql/no-undefined-type",
         "demo-gql/duplicate-type",
+        "demo-gql/no-unused-type",
     ] {
         assert!(out.contains(id), "missing wasm rule {id} in\n{out}");
     }
@@ -286,6 +329,45 @@ fn wasm_plugin_findings_work_in_json_output() {
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(text.contains("\"rule_id\""), "json out: {text}");
     assert!(text.contains("demo-gql/no-empty-type"));
+}
+
+// ---------------------------------------------------------------------------
+// Per-rule WASM modules: authored and added a la carte (eslint-style)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rule_modules_are_ala_carte() {
+    // Only one rule module installed -> exactly that rule is listed and run.
+    let scratch = Scratch::with_rules(
+        "alacarte",
+        "prefer = \"demo-gql\"\n",
+        &["rule_no_empty_type.wasm"],
+    );
+    let (code, out) = run_bin(&["list-rules"], &scratch.root);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("demo-gql/no-empty-type"), "{out}");
+    assert!(!out.contains("demo-gql/duplicate-type"), "{out}");
+    assert!(!out.contains("demo-gql/no-undefined-type"), "{out}");
+
+    let (code, out) = run_bin(&["check", "--format=json"], &scratch.root);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("demo-gql/no-empty-type"), "{out}");
+    assert!(!out.contains("demo-gql/duplicate-type"), "{out}");
+    assert!(!out.contains("demo-gql/no-undefined-type"), "{out}");
+}
+
+#[test]
+fn rule_options_from_config_reach_the_rule() {
+    let scratch = Scratch::new(
+        "ruleopts",
+        "prefer = \"demo-gql\"\n\n[rules.\"demo-gql/no-empty-type\".options]\nallow = [\"EmptyThing\"]\n",
+    );
+    let (code, out) = run_bin(&["check", "--format=json"], &scratch.root);
+    assert_eq!(code, 1, "other findings must still fire: {out}");
+    assert!(
+        !out.contains("EmptyThing"),
+        "rule options allow-list must be honoured: {out}"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,11 @@
+[package]
+name = "rule-no-empty-type"
+version.workspace = true
+edition.workspace = true
+description = "Example omni-lint rule module: demo-gql/no-empty-type (copy this crate to write your own rule)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+omni-guest.workspace = true

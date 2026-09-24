@@ -6,6 +6,8 @@
 //! [rules."graphql/no-empty-type"]
 //! enabled = true          # or false, or a severity string like "warn"
 //! severity = "error"      # optional severity override
+//! [rules."acme/no-foo".options]   # optional rule options, passed to the rule
+//! allow_names = ["id"]
 //!
 //! [targets]
 //! extensions = ["graphql", "gql"]   # optional: narrow which extensions are linted
@@ -39,6 +41,10 @@ pub struct Config {
     /// Directory containing the config file; relative paths resolve here.
     pub dir: PathBuf,
     pub rules: BTreeMap<String, RuleDirective>,
+    /// Per-rule options passed to the rule (`[rules."<id>"]` `options` table).
+    /// This is how an independently authored rule gets its settings, exactly
+    /// like an eslint rule's option array.
+    pub options: BTreeMap<String, toml::Table>,
     /// Restrict linting to these extensions (lowercase, no dot).
     pub extensions: Option<Vec<String>>,
     /// Glob ignore patterns relative to config dir.
@@ -109,6 +115,7 @@ impl Config {
                 };
                 let mut bool_flag: Option<bool> = None;
                 let mut severity: Option<crate::Severity> = None;
+                let mut options: Option<toml::Table> = None;
                 if let Some(v) = t.get("enabled") {
                     if let Some(b) = v.as_bool() {
                         bool_flag = Some(b);
@@ -122,11 +129,20 @@ impl Config {
                     };
                     severity = Some(parse_severity(s, id)?);
                 }
+                if let Some(v) = t.get("options") {
+                    let Some(t2) = v.as_table() else {
+                        return Err(format!("options for rule \"{id}\" must be a table"));
+                    };
+                    options = Some(t2.clone());
+                }
                 let directive = match (bool_flag, severity) {
                     (Some(false), _) => RuleDirective::Off,
                     (Some(true), sev) | (None, sev) => RuleDirective::On(sev),
                 };
                 cfg.rules.insert(id.clone(), directive);
+                if let Some(opts) = options {
+                    cfg.options.insert(id.clone(), opts);
+                }
             }
         }
 

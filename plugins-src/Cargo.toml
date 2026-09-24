@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["omni-guest", "demo-graphql-ast", "rules/no-empty-type", "rules/no-undefined-type", "rules/duplicate-type", "rules/no-unused-type"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+omni-guest = { path = "omni-guest" }
+
+# Every module here is a small standalone cdylib: one .wasm in, one module out.
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+strip = true

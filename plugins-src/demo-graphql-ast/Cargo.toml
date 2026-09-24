@@ -1,0 +1,12 @@
+[package]
+name = "demo-graphql-ast"
+version.workspace = true
+edition.workspace = true
+description = "Demo omni-lint language module: GraphQL SDL AST + facts, no rules"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+omni-guest.workspace = true
+serde_json.workspace = true
