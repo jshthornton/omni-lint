@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "demo-gql-rules"
+version = "0.1.0"
+dependencies = [
+ "omni-guest",
+ "serde_json",
+]
+
+[[package]]
 name = "demo-graphql-ast"
 version = "0.1.0"
 dependencies = [
@@ -49,13 +57,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rule-duplicate-type"
-version = "0.1.0"
-dependencies = [
- "omni-guest",
-]
-
-[[package]]
 name = "rule-no-empty-type"
 version = "0.1.0"
 dependencies = [
@@ -63,17 +64,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "rule-no-undefined-type"
+name = "rule-option-echo"
 version = "0.1.0"
 dependencies = [
  "omni-guest",
-]
-
-[[package]]
-name = "rule-no-unused-type"
-version = "0.1.0"
-dependencies = [
- "omni-guest",
+ "serde_json",
 ]
 
 [[package]]

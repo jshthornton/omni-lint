@@ -231,14 +231,28 @@ pub struct GuestError {
 // ---------------------------------------------------------------------------
 
 /// What `omni_rule_run` receives: every file's source and facts for the
-/// target language, the optional cross-file model, and this rule's options
-/// from `[rules."<id>"]` in `omni-lint.toml`.
+/// target language, the optional cross-file model, this rule's options from
+/// `[rules."<id>"]` in `omni-lint.toml`, and the rule subset this invocation
+/// is for (one entry for a per-rule adapter invocation; a pack's run function
+/// dispatches on `rules[].id`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct RuleEnvelope {
     pub language: String,
     pub files: Vec<RuleFile>,
     #[serde(default)]
     pub workspace: Option<serde_json::Value>,
+    #[serde(default)]
+    pub options: Option<serde_json::Value>,
+    #[serde(default)]
+    pub rules: Vec<RuleRef>,
+}
+
+/// One rule of the invocation subset.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RuleRef {
+    /// Full id, `namespace/rule-name` — dispatch on this in a pack.
+    pub id: String,
+    /// The rule's `[rules."<id>".options]` table, when configured.
     #[serde(default)]
     pub options: Option<serde_json::Value>,
 }
@@ -260,7 +274,14 @@ impl RuleEnvelope {
             files: Vec::new(),
             workspace: None,
             options: None,
+            rules: Vec::new(),
         })
+    }
+
+    /// The one rule ref of this invocation (per-rule adapter calls pass
+    /// exactly one).
+    pub fn rule(&self) -> Option<&RuleRef> {
+        self.rules.first()
     }
 
     /// The `workspace` facts, when the host has one and it parses as the

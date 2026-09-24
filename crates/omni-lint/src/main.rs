@@ -241,17 +241,22 @@ fn registry_for(config: Option<&omni_core::config::Config>) -> Registry {
                 r.register_plugin(std::sync::Arc::new(plugin));
             }
         }
-        // Rule modules: registered à la carte into the one ruleset.
+        // Rule packs: one .wasm bundle contributes all of its rules to the
+        // ruleset, each individually enable/disable/configurable in config
+        // (the eslint `extends` + per-rule keys model).
         let rules_dir = cfg.dir.join("rules");
         if rules_dir.is_dir() {
             let limits = load_wasm_limits(&rules_dir);
-            let (wasm_rules, errors) = omni_wasm::WasmRule::discover(&rules_dir, limits);
+            let (packs, errors) = omni_wasm::WasmRulePack::discover(&rules_dir, limits);
             for (path, err) in errors {
-                eprintln!("warning: rule module {} failed to load: {err}", path.display());
+                eprintln!("warning: rule pack {} failed to load: {err}", path.display());
             }
-            for rule in wasm_rules {
-                if let Err(e) = r.register_rule(std::sync::Arc::new(rule)) {
-                    eprintln!("warning: {e}");
+            for pack in packs {
+                for def in &pack.pack_meta.rules {
+                    let rule = omni_wasm::WasmRule::new(std::sync::Arc::clone(&pack), def);
+                    if let Err(e) = r.register_rule(std::sync::Arc::new(rule)) {
+                        eprintln!("warning: {e}");
+                    }
                 }
             }
         }

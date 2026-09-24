@@ -33,17 +33,15 @@ impl Scratch {
             name,
             config,
             &[
-                "rule_no_empty_type.wasm",
-                "rule_no_undefined_type.wasm",
-                "rule_duplicate_type.wasm",
-                "rule_no_unused_type.wasm",
+                "rule_no_empty_type.wasm", // single-rule module
+                "demo_gql_rules.wasm",     // rule pack: 3 rules (one off by default)
             ],
         )
     }
 
-    /// Scratch project with only the named rule modules in `rules/` — rules
-    /// join the ruleset a la carte, like dropping an entry into eslint's
-    /// `rules` map.
+    /// Scratch project with only the named rule modules in `rules/` —
+    /// extending the ruleset is simply which modules you drop in (an eslint
+    /// `extends` entry), and per-rule config keys tune them individually.
     fn with_rules(name: &str, config: &str, rules: &[&str]) -> Scratch {
         let base = std::env::temp_dir()
             .join(format!("omni-lint-e2e-{}-{name}", std::process::id()));
@@ -214,6 +212,8 @@ fn list_rules_shows_builtin_rules() {
 #[cfg(feature = "graphql")]
 #[test]
 fn clean_fixture_is_fully_baselined() {
+    // Reads the fixture while mutating tests may edit it: serialize.
+    let _guard = FIXTURE_LOCK.lock().unwrap();
     let result = check(&fixture_root());
     assert!(result.findings.is_empty(), "expected empty: {:?}", result.findings);
     assert_eq!(result.baselined, 2, "two committed findings stay baselined");
@@ -332,12 +332,13 @@ fn wasm_plugin_findings_work_in_json_output() {
 }
 
 // ---------------------------------------------------------------------------
-// Per-rule WASM modules: authored and added a la carte (eslint-style)
+// Rule packs (bundles): extend by dropping a module, tune per rule
 // ---------------------------------------------------------------------------
 
 #[test]
 fn rule_modules_are_ala_carte() {
-    // Only one rule module installed -> exactly that rule is listed and run.
+    // Only the single-rule module installed -> exactly that rule is listed
+    // and run; the pack's rules are absent entirely.
     let scratch = Scratch::with_rules(
         "alacarte",
         "prefer = \"demo-gql\"\n",
@@ -353,7 +354,80 @@ fn rule_modules_are_ala_carte() {
     assert_eq!(code, 1, "{out}");
     assert!(out.contains("demo-gql/no-empty-type"), "{out}");
     assert!(!out.contains("demo-gql/duplicate-type"), "{out}");
-    assert!(!out.contains("demo-gql/no-undefined-type"), "{out}");
+}
+
+#[test]
+fn a_rule_pack_extends_the_ruleset_with_all_of_its_rules() {
+    // Drop only the pack in: every rule it declares joins the ruleset.
+    let scratch = Scratch::with_rules("packonly", "prefer = \"demo-gql\"\n", &["demo_gql_rules.wasm"]);
+    let (code, out) = run_bin(&["list-rules"], &scratch.root);
+    assert_eq!(code, 0, "{out}");
+    for id in [
+        "demo-gql/no-undefined-type",
+        "demo-gql/duplicate-type",
+        "demo-gql/no-unused-type",
+    ] {
+        assert!(out.contains(id), "pack rule {id} missing in\n{out}");
+    }
+    assert!(!out.contains("demo-gql/no-empty-type"), "{out}");
+
+    // Findings come from pack rules across all their shapes (fold, streaming).
+    let (code, out) = run_bin(&["check", "--format=json"], &scratch.root);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("demo-gql/no-undefined-type"), "{out}");
+    assert!(out.contains("demo-gql/duplicate-type"), "{out}");
+    // The pack graded no-unused-type `off`: registered, but silent.
+    assert!(!out.contains("demo-gql/no-unused-type"), "{out}");
+}
+
+#[test]
+fn individual_pack_rules_are_enabled_disabled_and_configured() {
+    // eslint-style extends + per-rule keys: disable one pack rule, opt in
+    // the off-by-default one.
+    let scratch = Scratch::new(
+        "packrules",
+        concat!(
+            "prefer = \"demo-gql\"\n",
+            "\n[rules.\"demo-gql/duplicate-type\"]\n",
+            "enabled = false\n",
+        ),
+    );
+    // Give a schema block so no-unused-type has unambiguous roots.
+    std::fs::write(
+        scratch.root.join("schema/entry.graphql"),
+        "schema {\n  query: QueryRoot\n}\ntype QueryRoot { x: String }\ntype Lonely { y: String }\n",
+    )
+    .unwrap();
+
+    // Off-by-default rule: silent without opting in...
+    let (code, out) = run_bin(&["check", "--format=json"], &scratch.root);
+    assert_eq!(code, 1, "{out}");
+    assert!(!out.contains("demo-gql/no-unused-type"), "{out}");
+    assert!(!out.contains("Lonely"), "{out}");
+    // ...the disabled pack rule is silent...
+    assert!(!out.contains("demo-gql/duplicate-type"), "{out}");
+    // ...other pack rules still run.
+    assert!(out.contains("demo-gql/no-undefined-type"), "{out}");
+    assert!(out.contains("Bool"), "{out}");
+
+    // Opt the off rule in: now its finding appears.
+    let opts = Scratch::new(
+        "packoptin",
+        concat!(
+            "prefer = \"demo-gql\"\n",
+            "\n[rules.\"demo-gql/no-unused-type\"]\n",
+            "enabled = true\n",
+        ),
+    );
+    std::fs::write(
+        opts.root.join("schema/entry.graphql"),
+        "schema {\n  query: QueryRoot\n}\ntype QueryRoot { x: String }\ntype Lonely { y: String }\n",
+    )
+    .unwrap();
+    let (code, out) = run_bin(&["check", "--format=json"], &opts.root);
+    assert!(code != 0 || out.contains("Lonely"), "{out}");
+    assert!(out.contains("demo-gql/no-unused-type"), "off rule opted in must run: {out}");
+    assert!(out.contains("Lonely"), "{out}");
 }
 
 #[test]

@@ -1,0 +1,12 @@
+[package]
+name = "demo-gql-rules"
+version.workspace = true
+edition.workspace = true
+description = "Example omni-lint RULE PACK: one .wasm bundle contributing several rules (template for authoring a rule collection)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+omni-guest.workspace = true
+serde_json.workspace = true

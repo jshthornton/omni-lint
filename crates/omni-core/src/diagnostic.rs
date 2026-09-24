@@ -10,6 +10,10 @@ pub enum Severity {
     Info,
     Warning,
     Error,
+    /// Rule-meta only: the rule is registered but disabled by default
+    /// (eslint "off" / rubocop opt-in). Never a finding severity; users opt
+    /// in per rule in `omni-lint.toml`.
+    Off,
 }
 
 impl Severity {
@@ -18,6 +22,7 @@ impl Severity {
             Severity::Info => "info",
             Severity::Warning => "warning",
             Severity::Error => "error",
+            Severity::Off => "off",
         }
     }
 
@@ -26,6 +31,7 @@ impl Severity {
             "info" => Some(Severity::Info),
             "warning" | "warn" => Some(Severity::Warning),
             "error" => Some(Severity::Error),
+            "off" => Some(Severity::Off),
             _ => None,
         }
     }

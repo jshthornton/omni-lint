@@ -218,6 +218,7 @@ fn scan_document(src: &str) -> i32 {
                         };
                         scan.skip_trivia();
                         if scan.eat(b':') {
+                            scan.skip_trivia();
                             let (ty, _, _) = type_ref(&mut scan);
                             facts.roots.push((op.to_string(), ty));
                         }
@@ -330,6 +331,7 @@ fn scan_document(src: &str) -> i32 {
                         if !scan.eat(b':') {
                             continue;
                         }
+                        scan.skip_trivia();
                         let (named, ty_span, required) = type_ref(&mut scan);
                         let directives = directives_until(&mut scan, b'\n');
                         facts.directives_used.extend(directives.iter().cloned());

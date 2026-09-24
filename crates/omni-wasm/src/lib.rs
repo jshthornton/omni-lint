@@ -14,15 +14,21 @@
 //!       omits this export the host synthesizes the merged view from the
 //!       per-file facts automatically.
 //!
-//! **Rule modules** (`<config dir>/rules/*.wasm`) implement exactly one lint
-//! rule each — this is what makes third-party rules as easy to add as an
-//! eslint rule. Contract:
+//! **Rule pack modules** (`<config dir>/rules/*.wasm`) ship a bundle of
+//! rules — the eslint-plugin / rubocop "gem" model: the app extends its
+//! ruleset with the pack, then enables/disables/configures each rule
+//! individually in `omni-lint.toml`. Contract:
 //!
-//!   exports: `memory`, `omni_alloc`, `omni_rule_meta`, `omni_rule_run`
-//!   - `omni_rule_meta() -> ptr` — UTF-8 JSON rule metadata
+//!   exports: `memory`, `omni_alloc`, `omni_pack_meta`, `omni_rule_run`
+//!   - `omni_pack_meta() -> ptr` — UTF-8 JSON `RulePackMeta`
 //!   - `omni_rule_run(ptr, len) -> ptr` — UTF-8 JSON array of findings for
 //!       the run envelope `{"language", "files": [{path, source, facts}],
-//!       "workspace", "options"}` (see `crate::rule::RuleModuleMeta`)
+//!       "workspace", "options", "rules": [{"id", "options"?}]}`
+//!       (disclaimer: per-rule adapter invocations carry exactly one entry;
+//!       see `crate::rule`)
+//!   A **single-rule module** exporting `omni_rule_meta` instead of
+//!   `omni_pack_meta` is a pack with one rule — the minimal "first rule"
+//!   shape.
 //!
 //! Both kinds report findings through `env.omni_report(ptr, len)` and/or a
 //! returned JSON array of `GuestFinding`. Every string-returning export uses
@@ -35,7 +41,7 @@ mod rule;
 mod session;
 
 pub use plugin::{MetaCapability, PluginMeta, WasmModule, WasmPlugin};
-pub use rule::{RuleFinding, RuleModuleMeta, WasmRule};
+pub use rule::{PackRuleDef, RuleFinding, RuleModuleMeta, RulePackMeta, WasmRule, WasmRulePack};
 pub use session::{GuestError, GuestFinding, WasmLimits, DEFAULT_FUEL, MAX_REPORTED_FINDINGS};
 
 /// `.wasm` files directly under `dir` (unsorted; loaders sort).

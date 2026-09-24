@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["omni-guest", "demo-graphql-ast", "rules/no-empty-type", "rules/no-undefined-type", "rules/duplicate-type", "rules/no-unused-type"]
+members = ["omni-guest", "demo-graphql-ast", "rules/no-empty-type", "rules/demo-gql-rules"]
 
 [workspace.package]
 version = "0.1.0"

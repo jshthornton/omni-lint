@@ -5,7 +5,7 @@
 
 use crate::baseline::{Baseline, BaselineEntry, BaselineMatch, Reportable};
 use crate::config::{Config, RuleDirective};
-use crate::diagnostic::{Diagnostic, SourceId, Span};
+use crate::diagnostic::{Diagnostic, Severity, SourceId, Span};
 use crate::plugin::{CapabilityScope, ParsedFile, Plugin};
 use crate::registry::Registry;
 use rayon::prelude::*;
@@ -131,7 +131,7 @@ pub fn run_check(root: &Path, config: &Config, registry: &Registry) -> Result<Ru
     let needed_caps: HashSet<String> = registry
         .rules()
         .iter()
-        .filter(|r| config.rules.get(r.meta().id) != Some(&RuleDirective::Off))
+        .filter(|r| rule_active(config, &r.meta()))
         .filter(|r| !r.meta().requires.is_empty())
         .map(|r| r.meta().requires.to_string())
         .collect();
@@ -166,7 +166,8 @@ pub fn run_check(root: &Path, config: &Config, registry: &Registry) -> Result<Ru
         }
     }
 
-    // Effective severities.
+    // Effective severities. `On(None)` over an off-by-default rule lifts it
+    // to warning (the rule opted in without picking a level).
     let severity_by_rule: BTreeMap<String, crate::Severity> = registry
         .rules()
         .iter()
@@ -174,6 +175,10 @@ pub fn run_check(root: &Path, config: &Config, registry: &Registry) -> Result<Ru
             let meta = r.meta();
             let sev = match config.rules.get(meta.id) {
                 Some(RuleDirective::On(Some(sev))) => *sev,
+                Some(RuleDirective::On(None)) if meta.default_severity == Severity::Off => {
+                    Severity::Warning
+                }
+                _ if meta.default_severity == Severity::Off => Severity::Off,
                 _ => meta.default_severity,
             };
             (meta.id.to_string(), sev)
@@ -184,7 +189,7 @@ pub fn run_check(root: &Path, config: &Config, registry: &Registry) -> Result<Ru
     let collected: Mutex<Vec<Diagnostic>> = Mutex::new(Vec::new());
     for rule in registry.rules() {
         let meta = rule.meta();
-        if config.rules.get(meta.id) == Some(&RuleDirective::Off) {
+        if !rule_active(config, &meta) {
             continue;
         }
         if !meta.requires.is_empty() && !available_caps.contains(meta.requires) {
@@ -229,7 +234,8 @@ pub fn run_check(root: &Path, config: &Config, registry: &Registry) -> Result<Ru
         }
     }
 
-    // Map to Reportable and apply severity overrides.
+    // Map to Reportable and apply severity overrides (including lifting an
+    // off-by-default rule the user opted into).
     let mut reportables: Vec<Reportable> = diagnostics
         .into_iter()
         .map(|mut d| {
@@ -242,6 +248,8 @@ pub fn run_check(root: &Path, config: &Config, registry: &Registry) -> Result<Ru
             }
         })
         .collect();
+    // A rule leaking an `off` severity (host or guest bug) never reports.
+    reportables.retain(|r| r.diag.severity != Severity::Off);
     reportables.sort_by(|a, b| {
         (&a.path, a.located.line, a.located.column, &a.diag.rule_id)
             .cmp(&(&b.path, b.located.line, b.located.column, &b.diag.rule_id))
@@ -310,6 +318,16 @@ fn empty_result() -> RunResult {
         files: 0,
         baselined: 0,
         totals: BTreeMap::new(),
+    }
+}
+
+/// Rule participates in the run: config may disable it, and pack rules
+/// defaulting to `off` only run when config enables them.
+fn rule_active(config: &Config, meta: &crate::plugin::RuleMeta) -> bool {
+    match config.rules.get(meta.id) {
+        Some(&RuleDirective::Off) => false,
+        Some(RuleDirective::On(_)) => true,
+        None => meta.default_severity != Severity::Off,
     }
 }
 

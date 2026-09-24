@@ -135,6 +135,11 @@ impl Config {
                     };
                     options = Some(t2.clone());
                 }
+                // `severity = "off"` disables, like enabled = false.
+                if severity == Some(crate::Severity::Off) {
+                    bool_flag = Some(false);
+                    severity = None;
+                }
                 let directive = match (bool_flag, severity) {
                     (Some(false), _) => RuleDirective::Off,
                     (Some(true), sev) | (None, sev) => RuleDirective::On(sev),
