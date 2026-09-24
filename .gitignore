@@ -2,6 +2,6 @@
 .pi/
 tests/fixtures/bench-*/schema/
 tests/fixtures/bench-*/omni-lint-baseline.json
-plugins-src/demo-graphql-plugin/target/
+plugins-src/target/
 *.target
 tests/fixtures/wasm-plugin/omni-lint-baseline.json
